@@ -9,6 +9,8 @@ on:
 jobs:
   check:
     # Run `cargo check` first to ensure that the pushed code at least compiles.
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@master
@@ -31,6 +33,8 @@ jobs:
         args: --all -- --check
 
   check-docs:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@master
@@ -47,6 +51,8 @@ jobs:
       run: cargo doc --all-features --no-deps
 
   cargo-hack:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@master
@@ -64,6 +70,8 @@ jobs:
       run: cargo hack check --each-feature --no-dev-deps --all
 
   test-versions:
+    permissions:
+      contents: read
     needs: check
     runs-on: ubuntu-latest
     strategy:
@@ -86,6 +94,8 @@ jobs:
   # some examples doesn't support 1.54 (such as async-graphql)
   # so we only test axum itself on 1.54
   test-msrv:
+    permissions:
+      contents: read
     needs: check
     runs-on: ubuntu-latest
     strategy:
@@ -106,6 +116,8 @@ jobs:
         args: -p axum --all-features --all-targets
 
   test-docs:
+    permissions:
+      contents: read
     needs: check
     runs-on: ubuntu-latest
     steps:
