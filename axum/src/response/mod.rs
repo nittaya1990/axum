@@ -1,471 +1,55 @@
 #![doc = include_str!("../docs/response.md")]
 
-use crate::{
-    body::{box_body, BoxBody},
-    BoxError, Error,
-};
-use bytes::Bytes;
-use http::{header, HeaderMap, HeaderValue, Response, StatusCode};
-use http_body::{
-    combinators::{MapData, MapErr},
-    Empty, Full,
-};
-use std::{borrow::Cow, convert::Infallible};
+use http::{header, HeaderValue, StatusCode};
 
-mod headers;
 mod redirect;
 
+#[cfg(feature = "tokio")]
 pub mod sse;
 
 #[doc(no_inline)]
 #[cfg(feature = "json")]
 pub use crate::Json;
 
+#[cfg(feature = "form")]
+#[doc(no_inline)]
+pub use crate::form::Form;
+
+#[doc(no_inline)]
+pub use crate::Extension;
+
 #[doc(inline)]
-pub use self::{headers::Headers, redirect::Redirect, sse::Sse};
+pub use axum_core::response::{
+    AppendHeaders, ErrorResponse, IntoResponse, IntoResponseParts, Response, ResponseParts, Result,
+};
 
-/// Trait for generating responses.
-///
-/// Types that implement `IntoResponse` can be returned from handlers.
-///
-/// # Implementing `IntoResponse`
-///
-/// You generally shouldn't have to implement `IntoResponse` manually, as axum
-/// provides implementations for many common types.
-///
-/// However it might be necessary if you have a custom error type that you want
-/// to return from handlers:
-///
-/// ```rust
-/// use axum::{
-///     Router,
-///     body::Body,
-///     routing::get,
-///     http::{Response, StatusCode},
-///     response::IntoResponse,
-/// };
-///
-/// enum MyError {
-///     SomethingWentWrong,
-///     SomethingElseWentWrong,
-/// }
-///
-/// impl IntoResponse for MyError {
-///     type Body = Body;
-///     type BodyError = <Self::Body as axum::body::HttpBody>::Error;
-///
-///     fn into_response(self) -> Response<Self::Body> {
-///         let body = match self {
-///             MyError::SomethingWentWrong => {
-///                 Body::from("something went wrong")
-///             },
-///             MyError::SomethingElseWentWrong => {
-///                 Body::from("something else went wrong")
-///             },
-///         };
-///
-///         Response::builder()
-///             .status(StatusCode::INTERNAL_SERVER_ERROR)
-///             .body(body)
-///             .unwrap()
-///     }
-/// }
-///
-/// // `Result<impl IntoResponse, MyError>` can now be returned from handlers
-/// let app = Router::new().route("/", get(handler));
-///
-/// async fn handler() -> Result<(), MyError> {
-///     Err(MyError::SomethingWentWrong)
-/// }
-/// # async {
-/// # hyper::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
-/// # };
-/// ```
-///
-/// Or if you have a custom body type you'll also need to implement
-/// `IntoResponse` for it:
-///
-/// ```rust
-/// use axum::{
-///     routing::get,
-///     response::IntoResponse,
-///     Router,
-/// };
-/// use http_body::Body;
-/// use http::{Response, HeaderMap};
-/// use bytes::Bytes;
-/// use std::{
-///     convert::Infallible,
-///     task::{Poll, Context},
-///     pin::Pin,
-/// };
-///
-/// struct MyBody;
-///
-/// // First implement `Body` for `MyBody`. This could for example use
-/// // some custom streaming protocol.
-/// impl Body for MyBody {
-///     type Data = Bytes;
-///     type Error = Infallible;
-///
-///     fn poll_data(
-///         self: Pin<&mut Self>,
-///         cx: &mut Context<'_>
-///     ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
-///         # unimplemented!()
-///         // ...
-///     }
-///
-///     fn poll_trailers(
-///         self: Pin<&mut Self>,
-///         cx: &mut Context<'_>
-///     ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
-///         # unimplemented!()
-///         // ...
-///     }
-/// }
-///
-/// // Now we can implement `IntoResponse` directly for `MyBody`
-/// impl IntoResponse for MyBody {
-///     type Body = Self;
-///     type BodyError = <Self as Body>::Error;
-///
-///     fn into_response(self) -> Response<Self::Body> {
-///         Response::new(self)
-///     }
-/// }
-///
-/// // We don't need to implement `IntoResponse for Response<MyBody>` as that is
-/// // covered by a blanket implementation in axum.
-///
-/// // `MyBody` can now be returned from handlers.
-/// let app = Router::new().route("/", get(|| async { MyBody }));
-/// # async {
-/// # hyper::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
-/// # };
-/// ```
-pub trait IntoResponse {
-    /// The body type of the response.
-    ///
-    /// Unless you're implementing this trait for a custom body type, these are
-    /// some common types you can use:
-    ///
-    /// - [`axum::body::Body`]: A good default that supports most use cases.
-    /// - [`axum::body::Empty<Bytes>`]: When you know your response is always
-    /// empty.
-    /// - [`axum::body::Full<Bytes>`]: When you know your response always
-    /// contains exactly one chunk.
-    /// - [`axum::body::BoxBody`]: If you need to unify multiple body types into
-    /// one, or return a body type that cannot be named. Can be created with
-    /// [`box_body`].
-    ///
-    /// [`axum::body::Body`]: crate::body::Body
-    /// [`axum::body::Empty<Bytes>`]: crate::body::Empty
-    /// [`axum::body::Full<Bytes>`]: crate::body::Full
-    /// [`axum::body::BoxBody`]: crate::body::BoxBody
-    type Body: http_body::Body<Data = Bytes, Error = Self::BodyError> + Send + 'static;
+#[doc(inline)]
+pub use self::redirect::Redirect;
 
-    /// The error type `Self::Body` might generate.
-    ///
-    /// Generally it should be possible to set this to:
-    ///
-    /// ```rust,ignore
-    /// type BodyError = <Self::Body as axum::body::HttpBody>::Error;
-    /// ```
-    ///
-    /// This associated type exists mainly to make returning `impl IntoResponse`
-    /// possible and to simplify trait bounds internally in axum.
-    type BodyError: Into<BoxError>;
-
-    /// Create a response.
-    fn into_response(self) -> Response<Self::Body>;
-}
-
-impl IntoResponse for () {
-    type Body = Empty<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        Response::new(Empty::new())
-    }
-}
-
-impl IntoResponse for Infallible {
-    type Body = Empty<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        match self {}
-    }
-}
-
-impl<T, E> IntoResponse for Result<T, E>
-where
-    T: IntoResponse,
-    E: IntoResponse,
-{
-    type Body = BoxBody;
-    type BodyError = Error;
-
-    fn into_response(self) -> Response<Self::Body> {
-        match self {
-            Ok(value) => value.into_response().map(box_body),
-            Err(err) => err.into_response().map(box_body),
-        }
-    }
-}
-
-impl<B> IntoResponse for Response<B>
-where
-    B: http_body::Body<Data = Bytes> + Send + 'static,
-    B::Error: Into<BoxError>,
-{
-    type Body = B;
-    type BodyError = <B as http_body::Body>::Error;
-
-    fn into_response(self) -> Self {
-        self
-    }
-}
-
-macro_rules! impl_into_response_for_body {
-    ($body:ty) => {
-        impl IntoResponse for $body {
-            type Body = $body;
-            type BodyError = <$body as http_body::Body>::Error;
-
-            fn into_response(self) -> Response<Self> {
-                Response::new(self)
-            }
-        }
-    };
-}
-
-impl_into_response_for_body!(hyper::Body);
-impl_into_response_for_body!(Full<Bytes>);
-impl_into_response_for_body!(Empty<Bytes>);
-
-impl<E> IntoResponse for http_body::combinators::BoxBody<Bytes, E>
-where
-    E: Into<BoxError> + 'static,
-{
-    type Body = Self;
-    type BodyError = E;
-
-    fn into_response(self) -> Response<Self> {
-        Response::new(self)
-    }
-}
-
-impl<E> IntoResponse for http_body::combinators::UnsyncBoxBody<Bytes, E>
-where
-    E: Into<BoxError> + 'static,
-{
-    type Body = Self;
-    type BodyError = E;
-
-    fn into_response(self) -> Response<Self> {
-        Response::new(self)
-    }
-}
-
-impl<B, F> IntoResponse for MapData<B, F>
-where
-    B: http_body::Body + Send + 'static,
-    F: FnMut(B::Data) -> Bytes + Send + 'static,
-    B::Error: Into<BoxError>,
-{
-    type Body = Self;
-    type BodyError = <B as http_body::Body>::Error;
-
-    fn into_response(self) -> Response<Self::Body> {
-        Response::new(self)
-    }
-}
-
-impl<B, F, E> IntoResponse for MapErr<B, F>
-where
-    B: http_body::Body<Data = Bytes> + Send + 'static,
-    F: FnMut(B::Error) -> E + Send + 'static,
-    E: Into<BoxError>,
-{
-    type Body = Self;
-    type BodyError = E;
-
-    fn into_response(self) -> Response<Self::Body> {
-        Response::new(self)
-    }
-}
-
-impl IntoResponse for &'static str {
-    type Body = Full<Bytes>;
-    type BodyError = Infallible;
-
-    #[inline]
-    fn into_response(self) -> Response<Self::Body> {
-        Cow::Borrowed(self).into_response()
-    }
-}
-
-impl IntoResponse for String {
-    type Body = Full<Bytes>;
-    type BodyError = Infallible;
-
-    #[inline]
-    fn into_response(self) -> Response<Self::Body> {
-        Cow::<'static, str>::Owned(self).into_response()
-    }
-}
-
-impl IntoResponse for std::borrow::Cow<'static, str> {
-    type Body = Full<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        let mut res = Response::new(Full::from(self));
-        res.headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-        res
-    }
-}
-
-impl IntoResponse for Bytes {
-    type Body = Full<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        let mut res = Response::new(Full::from(self));
-        res.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        res
-    }
-}
-
-impl IntoResponse for &'static [u8] {
-    type Body = Full<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        let mut res = Response::new(Full::from(self));
-        res.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        res
-    }
-}
-
-impl IntoResponse for Vec<u8> {
-    type Body = Full<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        let mut res = Response::new(Full::from(self));
-        res.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        res
-    }
-}
-
-impl IntoResponse for std::borrow::Cow<'static, [u8]> {
-    type Body = Full<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        let mut res = Response::new(Full::from(self));
-        res.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        res
-    }
-}
-
-impl IntoResponse for StatusCode {
-    type Body = Empty<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        Response::builder().status(self).body(Empty::new()).unwrap()
-    }
-}
-
-impl<T> IntoResponse for (StatusCode, T)
-where
-    T: IntoResponse,
-{
-    type Body = T::Body;
-    type BodyError = T::BodyError;
-
-    fn into_response(self) -> Response<T::Body> {
-        let mut res = self.1.into_response();
-        *res.status_mut() = self.0;
-        res
-    }
-}
-
-impl<T> IntoResponse for (HeaderMap, T)
-where
-    T: IntoResponse,
-{
-    type Body = T::Body;
-    type BodyError = T::BodyError;
-
-    fn into_response(self) -> Response<T::Body> {
-        let mut res = self.1.into_response();
-        res.headers_mut().extend(self.0);
-        res
-    }
-}
-
-impl<T> IntoResponse for (StatusCode, HeaderMap, T)
-where
-    T: IntoResponse,
-{
-    type Body = T::Body;
-    type BodyError = T::BodyError;
-
-    fn into_response(self) -> Response<T::Body> {
-        let mut res = self.2.into_response();
-        *res.status_mut() = self.0;
-        res.headers_mut().extend(self.1);
-        res
-    }
-}
-
-impl IntoResponse for HeaderMap {
-    type Body = Empty<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        let mut res = Response::new(Empty::new());
-        *res.headers_mut() = self;
-        res
-    }
-}
+#[doc(inline)]
+#[cfg(feature = "tokio")]
+pub use sse::Sse;
 
 /// An HTML response.
 ///
 /// Will automatically get `Content-Type: text/html`.
 #[derive(Clone, Copy, Debug)]
+#[must_use]
 pub struct Html<T>(pub T);
 
 impl<T> IntoResponse for Html<T>
 where
-    T: Into<Full<Bytes>>,
+    T: IntoResponse,
 {
-    type Body = Full<Bytes>;
-    type BodyError = Infallible;
-
-    fn into_response(self) -> Response<Self::Body> {
-        let mut res = Response::new(self.0.into());
-        res.headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
-        res
+    fn into_response(self) -> Response {
+        (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(mime::TEXT_HTML_UTF_8.as_ref()),
+            )],
+            self.0,
+        )
+            .into_response()
     }
 }
 
@@ -475,45 +59,201 @@ impl<T> From<T> for Html<T> {
     }
 }
 
+/// An empty response with 204 No Content status.
+///
+/// Due to historical and implementation reasons, the `IntoResponse` implementation of `()`
+/// (unit type) returns an empty response with 200 [`StatusCode::OK`] status.
+/// If you specifically want a 204 [`StatusCode::NO_CONTENT`] status, you can use either `StatusCode` type
+/// directly, or this shortcut struct for self-documentation.
+///
+/// ```
+/// use axum::{extract::Path, response::NoContent};
+///
+/// async fn delete_user(Path(user): Path<String>) -> Result<NoContent, String> {
+///     // ...access database...
+/// # drop(user);
+///     Ok(NoContent)
+/// }
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct NoContent;
+
+impl IntoResponse for NoContent {
+    fn into_response(self) -> Response {
+        StatusCode::NO_CONTENT.into_response()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::body::Body;
-    use http::header::{HeaderMap, HeaderName};
+    use crate::extract::Extension;
+    use crate::{routing::get, Router};
+    use axum_core::response::IntoResponse;
+    use http::HeaderMap;
+    use http::{StatusCode, Uri};
 
-    #[test]
-    fn test_merge_headers() {
-        struct MyResponse;
+    // just needs to compile
+    #[allow(dead_code)]
+    fn impl_trait_result_works() {
+        async fn impl_trait_ok() -> Result<impl IntoResponse, ()> {
+            Ok(())
+        }
 
-        impl IntoResponse for MyResponse {
-            type Body = Body;
-            type BodyError = <Self::Body as http_body::Body>::Error;
+        async fn impl_trait_err() -> Result<(), impl IntoResponse> {
+            Err(())
+        }
 
-            fn into_response(self) -> Response<Body> {
-                let mut resp = Response::new(String::new().into());
-                resp.headers_mut()
-                    .insert(HeaderName::from_static("a"), HeaderValue::from_static("1"));
-                resp
+        async fn impl_trait_both(uri: Uri) -> Result<impl IntoResponse, impl IntoResponse> {
+            if uri.path() == "/" {
+                Ok(())
+            } else {
+                Err(())
             }
         }
 
-        fn check(resp: impl IntoResponse) {
-            let resp = resp.into_response();
-            assert_eq!(
-                resp.headers().get(HeaderName::from_static("a")).unwrap(),
-                &HeaderValue::from_static("1")
-            );
-            assert_eq!(
-                resp.headers().get(HeaderName::from_static("b")).unwrap(),
-                &HeaderValue::from_static("2")
-            );
+        async fn impl_trait(uri: Uri) -> impl IntoResponse {
+            if uri.path() == "/" {
+                Ok(())
+            } else {
+                Err(())
+            }
         }
 
-        let headers: HeaderMap =
-            std::iter::once((HeaderName::from_static("b"), HeaderValue::from_static("2")))
-                .collect();
+        _ = Router::<()>::new()
+            .route("/", get(impl_trait_ok))
+            .route("/", get(impl_trait_err))
+            .route("/", get(impl_trait_both))
+            .route("/", get(impl_trait));
+    }
 
-        check((headers.clone(), MyResponse));
-        check((StatusCode::OK, headers, MyResponse));
+    // just needs to compile
+    #[allow(dead_code)]
+    fn tuple_responses() {
+        async fn status() -> impl IntoResponse {
+            StatusCode::OK
+        }
+
+        async fn status_headermap() -> impl IntoResponse {
+            (StatusCode::OK, HeaderMap::new())
+        }
+
+        async fn status_header_array() -> impl IntoResponse {
+            (StatusCode::OK, [("content-type", "text/plain")])
+        }
+
+        async fn status_headermap_body() -> impl IntoResponse {
+            (StatusCode::OK, HeaderMap::new(), String::new())
+        }
+
+        async fn status_header_array_body() -> impl IntoResponse {
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain")],
+                String::new(),
+            )
+        }
+
+        async fn status_headermap_impl_into_response() -> impl IntoResponse {
+            (StatusCode::OK, HeaderMap::new(), impl_into_response())
+        }
+
+        async fn status_header_array_impl_into_response() -> impl IntoResponse {
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain")],
+                impl_into_response(),
+            )
+        }
+
+        fn impl_into_response() -> impl IntoResponse {}
+
+        async fn status_header_array_extension_body() -> impl IntoResponse {
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain")],
+                Extension(1),
+                String::new(),
+            )
+        }
+
+        async fn status_header_array_extension_mixed_body() -> impl IntoResponse {
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain")],
+                Extension(1),
+                HeaderMap::new(),
+                String::new(),
+            )
+        }
+
+        //
+
+        async fn headermap() -> impl IntoResponse {
+            HeaderMap::new()
+        }
+
+        async fn header_array() -> impl IntoResponse {
+            [("content-type", "text/plain")]
+        }
+
+        async fn headermap_body() -> impl IntoResponse {
+            (HeaderMap::new(), String::new())
+        }
+
+        async fn header_array_body() -> impl IntoResponse {
+            ([("content-type", "text/plain")], String::new())
+        }
+
+        async fn headermap_impl_into_response() -> impl IntoResponse {
+            (HeaderMap::new(), impl_into_response())
+        }
+
+        async fn header_array_impl_into_response() -> impl IntoResponse {
+            ([("content-type", "text/plain")], impl_into_response())
+        }
+
+        async fn header_array_extension_body() -> impl IntoResponse {
+            (
+                [("content-type", "text/plain")],
+                Extension(1),
+                String::new(),
+            )
+        }
+
+        async fn header_array_extension_mixed_body() -> impl IntoResponse {
+            (
+                [("content-type", "text/plain")],
+                Extension(1),
+                HeaderMap::new(),
+                String::new(),
+            )
+        }
+
+        _ = Router::<()>::new()
+            .route("/", get(status))
+            .route("/", get(status_headermap))
+            .route("/", get(status_header_array))
+            .route("/", get(status_headermap_body))
+            .route("/", get(status_header_array_body))
+            .route("/", get(status_headermap_impl_into_response))
+            .route("/", get(status_header_array_impl_into_response))
+            .route("/", get(status_header_array_extension_body))
+            .route("/", get(status_header_array_extension_mixed_body))
+            .route("/", get(headermap))
+            .route("/", get(header_array))
+            .route("/", get(headermap_body))
+            .route("/", get(header_array_body))
+            .route("/", get(headermap_impl_into_response))
+            .route("/", get(header_array_impl_into_response))
+            .route("/", get(header_array_extension_body))
+            .route("/", get(header_array_extension_mixed_body));
+    }
+
+    #[test]
+    fn no_content() {
+        assert_eq!(
+            super::NoContent.into_response().status(),
+            StatusCode::NO_CONTENT,
+        )
     }
 }

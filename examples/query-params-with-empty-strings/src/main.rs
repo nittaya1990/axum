@@ -5,14 +5,16 @@
 //! ```
 
 use axum::{extract::Query, routing::get, Router};
-use serde::{de::IntoDeserializer, Deserialize, Deserializer};
+use serde::{de, Deserialize, Deserializer};
+use std::{fmt, str::FromStr};
 
 #[tokio::main]
 async fn main() {
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
-        .serve(app().into_make_service())
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
+    println!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app()).await.unwrap();
 }
 
 fn app() -> Router {
@@ -20,7 +22,7 @@ fn app() -> Router {
 }
 
 async fn handler(Query(params): Query<Params>) -> String {
-    format!("{:?}", params)
+    format!("{params:?}")
 }
 
 /// See the tests below for which combinations of `foo` and `bar` result in
@@ -31,9 +33,10 @@ async fn handler(Query(params): Query<Params>) -> String {
 ///
 /// [`serde_with`]: https://docs.rs/serde_with/1.11.0/serde_with/rust/string_empty_as_none/index.html
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Params {
     #[serde(default, deserialize_with = "empty_string_as_none")]
-    foo: Option<String>,
+    foo: Option<i32>,
     bar: Option<String>,
 }
 
@@ -41,12 +44,13 @@ struct Params {
 fn empty_string_as_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
-    T: Deserialize<'de>,
+    T: FromStr,
+    T::Err: fmt::Display,
 {
     let opt = Option::<String>::deserialize(de)?;
     match opt.as_deref() {
         None | Some("") => Ok(None),
-        Some(s) => T::deserialize(s.into_deserializer()).map(Some),
+        Some(s) => FromStr::from_str(s).map_err(de::Error::custom).map(Some),
     }
 }
 
@@ -54,13 +58,14 @@ where
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     #[tokio::test]
     async fn test_something() {
         assert_eq!(
-            send_request_get_body("foo=foo&bar=bar").await,
-            r#"Params { foo: Some("foo"), bar: Some("bar") }"#,
+            send_request_get_body("foo=1&bar=bar").await,
+            r#"Params { foo: Some(1), bar: Some("bar") }"#,
         );
 
         assert_eq!(
@@ -74,8 +79,8 @@ mod tests {
         );
 
         assert_eq!(
-            send_request_get_body("foo=foo").await,
-            r#"Params { foo: Some("foo"), bar: None }"#,
+            send_request_get_body("foo=1").await,
+            r#"Params { foo: Some(1), bar: None }"#,
         );
 
         assert_eq!(
@@ -103,14 +108,14 @@ mod tests {
         let body = app()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/?{}", query))
+                    .uri(format!("/?{query}"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap()
             .into_body();
-        let bytes = hyper::body::to_bytes(body).await.unwrap();
+        let bytes = body.collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 }

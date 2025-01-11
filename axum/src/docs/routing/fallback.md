@@ -1,4 +1,4 @@
-Add a fallback service to the router.
+Add a fallback [`Handler`] to the router.
 
 This service will be called if no routes matches the incoming request.
 
@@ -13,58 +13,49 @@ use axum::{
 
 let app = Router::new()
     .route("/foo", get(|| async { /* ... */ }))
-    .fallback(fallback.into_service());
+    .fallback(fallback);
 
-async fn fallback(uri: Uri) -> impl IntoResponse {
-    (StatusCode::NOT_FOUND, format!("No route for {}", uri))
+async fn fallback(uri: Uri) -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, format!("No route for {uri}"))
 }
-# async {
-# hyper::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
-# };
+# let _: Router = app;
 ```
 
 Fallbacks only apply to routes that aren't matched by anything in the
 router. If a handler is matched by a request but returns 404 the
-fallback is not called.
+fallback is not called. Note that this applies to [`MethodRouter`]s too: if the
+request hits a valid path but the [`MethodRouter`] does not have an appropriate
+method handler installed, the fallback is not called (use
+[`MethodRouter::fallback`] for this purpose instead).
 
-## When used with `Router::merge`
 
-If a router with a fallback is merged with another router that also has
-a fallback the fallback of the second router takes precedence:
+# Handling all requests without other routes
+
+Using `Router::new().fallback(...)` to accept all request regardless of path or
+method, if you don't have other routes, isn't optimal:
 
 ```rust
-use axum::{
-    Router,
-    routing::get,
-    handler::Handler,
-    response::IntoResponse,
-    http::{StatusCode, Uri},
-};
+use axum::Router;
 
-let one = Router::new()
-    .route("/one", get(|| async {}))
-    .fallback(fallback_one.into_service());
+async fn handler() {}
 
-let two = Router::new()
-    .route("/two", get(|| async {}))
-    .fallback(fallback_two.into_service());
+let app = Router::new().fallback(handler);
 
-let app = one.merge(two);
-
-async fn fallback_one() -> impl IntoResponse {}
-async fn fallback_two() -> impl IntoResponse {}
-
-// the fallback for `app` is `fallback_two`
 # async {
-# hyper::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, app).await.unwrap();
 # };
 ```
 
-If only one of the routers have a fallback that will be used in the
-merged router.
+Running the handler directly is faster since it avoids the overhead of routing:
 
-## When used with `Router::nest`
+```rust
+use axum::handler::HandlerWithoutStateExt;
 
-If a router with a fallback is nested inside another router the fallback
-of the nested router will be discarded and not used. This is such that
-the outer router's fallback takes precedence.
+async fn handler() {}
+
+# async {
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+axum::serve(listener, handler.into_make_service()).await.unwrap();
+# };
+```

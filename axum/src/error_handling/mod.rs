@@ -1,15 +1,18 @@
 #![doc = include_str!("../docs/error_handling.md")]
 
-use crate::{body::BoxBody, response::IntoResponse, BoxError};
-use bytes::Bytes;
-use http::{Request, Response};
-use std::convert::Infallible;
+use crate::{
+    extract::FromRequestParts,
+    http::Request,
+    response::{IntoResponse, Response},
+};
 use std::{
+    convert::Infallible,
     fmt,
+    future::Future,
     marker::PhantomData,
     task::{Context, Poll},
 };
-use tower::{util::Oneshot, ServiceExt as _};
+use tower::ServiceExt;
 use tower_layer::Layer;
 use tower_service::Service;
 
@@ -17,49 +20,34 @@ use tower_service::Service;
 /// that handles errors by converting them into responses.
 ///
 /// See [module docs](self) for more details on axum's error handling model.
-pub struct HandleErrorLayer<F, B> {
+pub struct HandleErrorLayer<F, T> {
     f: F,
-    _marker: PhantomData<fn() -> B>,
+    _extractor: PhantomData<fn() -> T>,
 }
 
-impl<F, B> HandleErrorLayer<F, B> {
+impl<F, T> HandleErrorLayer<F, T> {
     /// Create a new `HandleErrorLayer`.
     pub fn new(f: F) -> Self {
         Self {
             f,
-            _marker: PhantomData,
+            _extractor: PhantomData,
         }
     }
 }
 
-impl<F, B, S> Layer<S> for HandleErrorLayer<F, B>
-where
-    F: Clone,
-{
-    type Service = HandleError<S, F, B>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        HandleError {
-            inner,
-            f: self.f.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<F, B> Clone for HandleErrorLayer<F, B>
+impl<F, T> Clone for HandleErrorLayer<F, T>
 where
     F: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             f: self.f.clone(),
-            _marker: PhantomData,
+            _extractor: PhantomData,
         }
     }
 }
 
-impl<F, B> fmt::Debug for HandleErrorLayer<F, B> {
+impl<F, E> fmt::Debug for HandleErrorLayer<F, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HandleErrorLayer")
             .field("f", &format_args!("{}", std::any::type_name::<F>()))
@@ -67,37 +55,52 @@ impl<F, B> fmt::Debug for HandleErrorLayer<F, B> {
     }
 }
 
-/// A [`Service`] adapter that handles errors by converting them into responses.
-///
-/// See [module docs](self) for more details on axum's error handling model.
-pub struct HandleError<S, F, B> {
-    inner: S,
-    f: F,
-    _marker: PhantomData<fn() -> B>,
-}
-
-impl<S, F, B> Clone for HandleError<S, F, B>
+impl<S, F, T> Layer<S> for HandleErrorLayer<F, T>
 where
-    S: Clone,
     F: Clone,
 {
-    fn clone(&self) -> Self {
-        Self::new(self.inner.clone(), self.f.clone())
+    type Service = HandleError<S, F, T>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        HandleError::new(inner, self.f.clone())
     }
 }
 
-impl<S, F, B> HandleError<S, F, B> {
+/// A [`Service`] adapter that handles errors by converting them into responses.
+///
+/// See [module docs](self) for more details on axum's error handling model.
+pub struct HandleError<S, F, T> {
+    inner: S,
+    f: F,
+    _extractor: PhantomData<fn() -> T>,
+}
+
+impl<S, F, T> HandleError<S, F, T> {
     /// Create a new `HandleError`.
     pub fn new(inner: S, f: F) -> Self {
         Self {
             inner,
             f,
-            _marker: PhantomData,
+            _extractor: PhantomData,
         }
     }
 }
 
-impl<S, F, B> fmt::Debug for HandleError<S, F, B>
+impl<S, F, T> Clone for HandleError<S, F, T>
+where
+    S: Clone,
+    F: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            f: self.f.clone(),
+            _extractor: PhantomData,
+        }
+    }
+}
+
+impl<S, F, E> fmt::Debug for HandleError<S, F, E>
 where
     S: fmt::Debug,
 {
@@ -109,94 +112,143 @@ where
     }
 }
 
-impl<S, F, ReqBody, ResBody, Res> Service<Request<ReqBody>> for HandleError<S, F, ReqBody>
+impl<S, F, B, Fut, Res> Service<Request<B>> for HandleError<S, F, ()>
 where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone,
-    F: FnOnce(S::Error) -> Res + Clone,
+    S: Service<Request<B>> + Clone + Send + 'static,
+    S::Response: IntoResponse + Send,
+    S::Error: Send,
+    S::Future: Send,
+    F: FnOnce(S::Error) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Res> + Send,
     Res: IntoResponse,
-    ResBody: http_body::Body<Data = Bytes> + Send + 'static,
-    ResBody::Error: Into<BoxError>,
+    B: Send + 'static,
 {
-    type Response = Response<BoxBody>;
+    type Response = Response;
     type Error = Infallible;
-    type Future = future::HandleErrorFuture<Oneshot<S, Request<ReqBody>>, F>;
+    type Future = future::HandleErrorFuture;
 
-    #[inline]
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        future::HandleErrorFuture {
-            f: Some(self.f.clone()),
-            inner: self.inner.clone().oneshot(req),
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        let f = self.f.clone();
+
+        let clone = self.inner.clone();
+        let inner = std::mem::replace(&mut self.inner, clone);
+
+        let future = Box::pin(async move {
+            match inner.oneshot(req).await {
+                Ok(res) => Ok(res.into_response()),
+                Err(err) => Ok(f(err).await.into_response()),
+            }
+        });
+
+        future::HandleErrorFuture { future }
+    }
+}
+
+#[allow(unused_macros)]
+macro_rules! impl_service {
+    ( $($ty:ident),* $(,)? ) => {
+        impl<S, F, B, Res, Fut, $($ty,)*> Service<Request<B>>
+            for HandleError<S, F, ($($ty,)*)>
+        where
+            S: Service<Request<B>> + Clone + Send + 'static,
+            S::Response: IntoResponse + Send,
+            S::Error: Send,
+            S::Future: Send,
+            F: FnOnce($($ty),*, S::Error) -> Fut + Clone + Send + 'static,
+            Fut: Future<Output = Res> + Send,
+            Res: IntoResponse,
+            $( $ty: FromRequestParts<()> + Send,)*
+            B: Send + 'static,
+        {
+            type Response = Response;
+            type Error = Infallible;
+
+            type Future = future::HandleErrorFuture;
+
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            #[allow(non_snake_case)]
+            fn call(&mut self, req: Request<B>) -> Self::Future {
+                let f = self.f.clone();
+
+                let clone = self.inner.clone();
+                let inner = std::mem::replace(&mut self.inner, clone);
+
+                let future = Box::pin(async move {
+                    let (mut parts, body) = req.into_parts();
+
+                    $(
+                        let $ty = match $ty::from_request_parts(&mut parts, &()).await {
+                            Ok(value) => value,
+                            Err(rejection) => return Ok(rejection.into_response()),
+                        };
+                    )*
+
+                    let req = Request::from_parts(parts, body);
+
+                    match inner.oneshot(req).await {
+                        Ok(res) => Ok(res.into_response()),
+                        Err(err) => Ok(f($($ty),*, err).await.into_response()),
+                    }
+                });
+
+                future::HandleErrorFuture { future }
+            }
         }
     }
 }
 
-/// Extension trait to [`Service`] for handling errors by mapping them to
-/// responses.
-///
-/// See [module docs](self) for more details on axum's error handling model.
-pub trait HandleErrorExt<B>: Service<Request<B>> + Sized {
-    /// Apply a [`HandleError`] middleware.
-    fn handle_error<F>(self, f: F) -> HandleError<Self, F, B> {
-        HandleError::new(self, f)
-    }
-}
-
-impl<B, S> HandleErrorExt<B> for S where S: Service<Request<B>> {}
+impl_service!(T1);
+impl_service!(T1, T2);
+impl_service!(T1, T2, T3);
+impl_service!(T1, T2, T3, T4);
+impl_service!(T1, T2, T3, T4, T5);
+impl_service!(T1, T2, T3, T4, T5, T6);
+impl_service!(T1, T2, T3, T4, T5, T6, T7);
+impl_service!(T1, T2, T3, T4, T5, T6, T7, T8);
+impl_service!(T1, T2, T3, T4, T5, T6, T7, T8, T9);
+impl_service!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10);
+impl_service!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
+impl_service!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12);
+impl_service!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13);
+impl_service!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14);
+impl_service!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15);
+impl_service!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16);
 
 pub mod future {
     //! Future types.
 
-    use crate::{
-        body::{box_body, BoxBody},
-        response::IntoResponse,
-        BoxError,
-    };
-    use bytes::Bytes;
-    use futures_util::ready;
-    use http::Response;
+    use crate::response::Response;
     use pin_project_lite::pin_project;
-    use std::convert::Infallible;
     use std::{
+        convert::Infallible,
         future::Future,
         pin::Pin,
         task::{Context, Poll},
     };
 
     pin_project! {
-        /// Response future for [`HandleError`](super::HandleError).
-        #[derive(Debug)]
-        pub struct HandleErrorFuture<Fut, F> {
+        /// Response future for [`HandleError`].
+        pub struct HandleErrorFuture {
             #[pin]
-            pub(super) inner: Fut,
-            pub(super) f: Option<F>,
+            pub(super) future: Pin<Box<dyn Future<Output = Result<Response, Infallible>>
+                + Send
+                + 'static
+            >>,
         }
     }
 
-    impl<Fut, F, E, B, Res> Future for HandleErrorFuture<Fut, F>
-    where
-        Fut: Future<Output = Result<Response<B>, E>>,
-        F: FnOnce(E) -> Res,
-        Res: IntoResponse,
-        B: http_body::Body<Data = Bytes> + Send + 'static,
-        B::Error: Into<BoxError>,
-    {
-        type Output = Result<Response<BoxBody>, Infallible>;
+    impl Future for HandleErrorFuture {
+        type Output = Result<Response, Infallible>;
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let this = self.project();
-
-            match ready!(this.inner.poll(cx)) {
-                Ok(res) => Ok(res.map(box_body)).into(),
-                Err(err) => {
-                    let f = this.f.take().unwrap();
-                    let res = f(err);
-                    Ok(res.into_response().map(box_body)).into()
-                }
-            }
+            self.project().future.poll(cx)
         }
     }
 }
