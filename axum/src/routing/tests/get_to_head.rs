@@ -5,7 +5,7 @@ use tower::ServiceExt;
 mod for_handlers {
     use super::*;
 
-    #[tokio::test]
+    #[crate::test]
     async fn get_handles_head() {
         let app = Router::new().route(
             "/",
@@ -31,26 +31,22 @@ mod for_handlers {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()["x-some-header"], "foobar");
 
-        let body = hyper::body::to_bytes(res.into_body()).await.unwrap();
+        let body = BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
         assert_eq!(body.len(), 0);
     }
 }
 
 mod for_services {
     use super::*;
-    use crate::routing::service_method_routing::get;
-    use http::header::HeaderValue;
 
-    #[tokio::test]
+    #[crate::test]
     async fn get_handles_head() {
         let app = Router::new().route(
             "/",
-            get(service_fn(|_req: Request<Body>| async move {
-                let res = Response::builder()
-                    .header("x-some-header", "foobar".parse::<HeaderValue>().unwrap())
-                    .body(Body::from("you shouldn't see this"))
-                    .unwrap();
-                Ok::<_, Infallible>(res)
+            get_service(service_fn(|_req: Request| async move {
+                Ok::<_, Infallible>(
+                    ([("x-some-header", "foobar")], "you shouldn't see this").into_response(),
+                )
             })),
         );
 
@@ -69,7 +65,7 @@ mod for_services {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()["x-some-header"], "foobar");
 
-        let body = hyper::body::to_bytes(res.into_body()).await.unwrap();
+        let body = BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
         assert_eq!(body.len(), 0);
     }
 }
